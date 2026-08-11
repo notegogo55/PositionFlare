@@ -1,0 +1,15 @@
+# ข้อมูลดิบ/ที่แปลงแล้ว — โหลดใหม่ได้จาก NOAA หรือแปลงใหม่ได้จาก proton_flux.py --convert
+GOES_proton_flux_integral/
+
+# cache ที่สร้างจากโค้ด — regenerate ด้วย proton_flux.py --build-series
+data_cache/
+
+# ผลลัพธ์รายงานที่สร้างจาก make_report.py
+out/
+
+# Python
+__pycache__/
+*.pyc
+
+# Windows folder metadata
+desktop.ini
