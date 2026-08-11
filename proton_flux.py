@@ -28,9 +28,17 @@ Proton Sensor) และ *ไม่มีช่อง integral ที่ต้�
 Usage
 -----
   python proton_flux.py --selftest
+  python proton_flux.py --download                 # โหลด netCDF ดิบจาก NOAA/NCEI
+  python proton_flux.py --download --sat GOES18 --start 20230101
   python proton_flux.py --convert                  # netCDF -> ข้อความรูปแบบ Primary
   python proton_flux.py --convert --sat GOES18 --workers 8
   python proton_flux.py --build-series             # cache รายชั่วโมงสำหรับหน้าเว็บ
+
+หมายเหตุ: GOES_proton_flux_integral/ ไม่ได้เก็บไว้ใน git (4GB+, โหลดใหม่ได้)
+เครื่องที่ clone repo มาใหม่ต้องรัน --download ก่อน --convert เสมอ ส่วน
+particle/{G08..G12,Primary,Secondary}/ (คลังก่อน 2020 ที่ SWPC เลิกผลิตไปแล้ว)
+ไม่มีโค้ดโหลดอัตโนมัติ เพราะแหล่งเดิมบน SWPC FTP ถูกถอดออกไปแล้ว (ตรวจสอบแล้วสิงหาคม
+2026) ต้องหาไฟล์ชุดนี้มาเองถ้าต้องการอนุกรมย้อนไปถึงปี 1998
 """
 
 from __future__ import annotations
@@ -41,6 +49,8 @@ import glob
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timezone
 
 import numpy as np
@@ -68,6 +78,101 @@ SAT_TAG = {"GOES16": "G16", "GOES18": "G18"}
 
 # ลำดับความน่าเชื่อถือของ product เมื่อวันเดียวกันมีหลายไฟล์
 PRODUCT_RANK = {"sci_sgps-l2-avg5m": 3, "sci_sgps-l2-avg1m": 2, "dn_sgps-l2-avg1m": 1}
+
+
+# --------------------------------------------------------------------------- #
+# 0. ดาวน์โหลด netCDF SGPS L2 จาก NOAA/NCEI (โฟลเดอร์นี้ไม่ได้เก็บไว้ใน git —
+#    ต้องโหลดเองก่อนถึงจะรัน --convert ได้)
+# --------------------------------------------------------------------------- #
+# โครงสร้างไดเรกทอรีตรวจสอบจริงแล้วด้วย urllib (ไม่ได้เดา):
+#   {NCEI_BASE}/{goes16,goes18}/l2/data/sgps-l2-avg5m/{YYYY}/{MM}/{filename}.nc
+# เอาแค่ product sci_sgps-l2-avg5m (rank สูงสุดใน PRODUCT_RANK อยู่แล้ว ครอบคลุม
+# เกือบทุกวัน) ไม่ไล่โหลด avg1m/dn_ ที่เป็น fallback ของบางวันด้วย เพราะยังไม่ได้
+# ตรวจสอบรูปแบบไฟล์จริงของสองอันนั้น — วันที่ไม่มี avg5m จะถูก convert() ข้ามไปเฉย ๆ
+# เหมือนวันที่ไม่มีข้อมูลกรณีอื่น ไม่ทำให้พัง
+NCEI_BASE = "https://data.ngdc.noaa.gov/platforms/solar-space-observing-satellites/goes"
+NCEI_SAT_DIR = {"GOES16": "goes16", "GOES18": "goes18"}
+_YEAR_RE = re.compile(r'href="(\d{4})/"')
+_MONTH_RE = re.compile(r'href="(\d{2})/"')
+_NC_FILE_RE = re.compile(r'href="(sci_sgps-l2-avg5m_g\d+_d(\d{8})_v[\d.\-]+\.nc)"')
+
+
+def _fetch_url(url: str, timeout: int = 60) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "solar-research/2.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _list_index(url: str, pattern: re.Pattern) -> list[str]:
+    """แกะชื่อไดเรกทอรีย่อย/ไฟล์จากหน้า Apache directory index — คืน [] เงียบ ๆ
+    ถ้าเข้าไม่ได้ (ปีที่ยังไม่มีข้อมูล, เน็ตหลุดชั่วคราว) ให้ผู้เรียกตัดสินใจเอง"""
+    try:
+        html = _fetch_url(url).decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return []
+    return sorted(set(pattern.findall(html)))
+
+
+def _download_one(job: tuple[str, str, bool]) -> tuple[str, str]:
+    url, out, overwrite = job
+    if os.path.exists(out) and not overwrite:
+        return out, "skip"
+    try:
+        data = _fetch_url(url, timeout=120)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return out, f"error: {type(e).__name__}: {e}"
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = out + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, out)                  # atomic — ไฟล์โดนตัดกลางทางจะไม่ค้างเป็นไฟล์ดี
+    return out, "ok"
+
+
+def download_nc(sats=("GOES16", "GOES18"), start: str | None = None,
+                end: str | None = None, workers: int = 8,
+                overwrite: bool = False) -> None:
+    """โหลด sci_sgps-l2-avg5m ของแต่ละดาวเทียมจาก NCEI มาลง path เดียวกับที่
+    discover_nc() คาดหวัง (GOES_proton_flux_integral/{sat}/YYYY/MM/) — โหลดเสร็จ
+    แล้วรัน --convert ต่อได้ทันทีไม่ต้องแก้อะไร
+
+    start/end เป็นสตริง YYYYMMDD (เทียบแค่ตำแหน่งปี/วันแบบ string ก็พอเพราะเป็น
+    เลขความยาวคงที่) ไม่ระบุ = ไล่โหลดทุกปีที่มีอยู่บนเซิร์ฟเวอร์
+    """
+    for sat in sats:
+        sdir = NCEI_SAT_DIR[sat]
+        root = f"{NCEI_BASE}/{sdir}/l2/data/sgps-l2-avg5m/"
+        years = _list_index(root, _YEAR_RE)
+        if not years:
+            print(f"  ! {sat}: เข้าไดเรกทอรีปีไม่ได้ ({root}) — ข้ามดาวเทียมนี้")
+            continue
+        if start:
+            years = [y for y in years if y >= start[:4]]
+        if end:
+            years = [y for y in years if y <= end[:4]]
+
+        print(f"\n=== {sat}: ไล่หาไฟล์ปี {years[0]}..{years[-1]} ===")
+        jobs = []
+        for y in years:
+            for m in _list_index(f"{root}{y}/", _MONTH_RE):
+                murl = f"{root}{y}/{m}/"
+                for fname, day in _list_index(murl, _NC_FILE_RE):
+                    if (start and day < start) or (end and day > end):
+                        continue
+                    out = os.path.join(ROOT, sat, y, m, fname)
+                    jobs.append((murl + fname, out, overwrite))
+
+        print(f"  พบ {len(jobs)} ไฟล์บนเซิร์ฟเวอร์")
+        tally: dict[str, int] = {}
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:      # I/O bound -> thread พอ
+            for i, (out, status) in enumerate(ex.map(_download_one, jobs), 1):
+                key = status if status in ("ok", "skip") else "error"
+                tally[key] = tally.get(key, 0) + 1
+                if key == "error" and tally[key] <= 3:
+                    print(f"  ! {out}: {status}")
+                if i % 500 == 0:
+                    print(f"  ... {i}/{len(jobs)}  {tally}")
+        print(f"  {sat} เสร็จ: {tally}")
 
 
 # --------------------------------------------------------------------------- #
@@ -628,6 +733,20 @@ def selftest() -> int:
     # ---- MJD ตรงกับที่ไฟล์ต้นฉบับเขียนไว้ ----------------------------------- #
     assert _mjd(date(2017, 1, 1)) == 57754, _mjd(date(2017, 1, 1))
 
+    # ---- regex ของ download_nc() ต้องแกะ href จริงของ Apache index บน NCEI ---- #
+    # (ตัวอย่างต่อไปนี้คัดลอกมาจาก HTML จริงที่ตรวจสอบด้วย urllib ตรง ๆ ไม่ได้เดา)
+    year_html = ('<a href="?C=N;O=D">Name</a> <a href="2020/">2020/</a> '
+                 '<a href="2021/">2021/</a> <a href="2022/">2022/</a>')
+    assert _YEAR_RE.findall(year_html) == ["2020", "2021", "2022"]
+
+    month_html = '<a href="08/">08/</a> <a href="09/">09/</a>'
+    assert _MONTH_RE.findall(month_html) == ["08", "09"]
+
+    file_html = ('<a href="sci_sgps-l2-avg5m_g16_d20220913_v3-0-0.nc">'
+                 'sci_sgps-l2-avg5m_g16_d20220913_v3-0-0.nc</a>')
+    assert _NC_FILE_RE.findall(file_html) == [
+        ("sci_sgps-l2-avg5m_g16_d20220913_v3-0-0.nc", "20220913")]
+
     # ---- อ่านไฟล์จริงได้ทั้งรุ่น E>0.6 และ E>0.8 ---------------------------- #
     for sub, label in (("G09", "E>0.6"), ("Primary", "E>0.8")):
         fs = list(_iter_source_files(sub))
@@ -716,16 +835,24 @@ def selftest() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[4])
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--download", action="store_true",
+                    help="โหลด netCDF ดิบจาก NOAA/NCEI มาลง GOES_proton_flux_integral/")
     ap.add_argument("--convert", action="store_true")
     ap.add_argument("--build-series", action="store_true")
     ap.add_argument("--sat", nargs="+", default=["GOES16", "GOES18"],
                     choices=["GOES16", "GOES18"])
+    ap.add_argument("--start", metavar="YYYYMMDD",
+                    help="จำกัดช่วงวันที่สำหรับ --download (ค่าเริ่มต้น: ทุกปีที่มี)")
+    ap.add_argument("--end", metavar="YYYYMMDD")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
+    if args.download:
+        download_nc(args.sat, start=args.start, end=args.end,
+                    workers=args.workers, overwrite=args.overwrite)
     if args.convert:
         convert(args.sat, workers=args.workers, overwrite=args.overwrite)
     if args.build_series:
@@ -733,7 +860,7 @@ def main() -> int:
         s = build_hourly_series()
         p = save_hourly(s)
         print(f"  -> {p}  ({os.path.getsize(p)/1e6:.2f} MB)")
-    if not (args.convert or args.build_series):
+    if not (args.download or args.convert or args.build_series):
         ap.print_help()
     return 0
 
